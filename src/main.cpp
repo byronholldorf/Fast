@@ -1,32 +1,32 @@
 #include <Arduino.h>
 #include <Arduboy2.h>
-#include <Tinyfont.h>
+#include <Tinyerfont.h>
 #include <Sprites.h>
 
 #include "draw.h"
 #include "images.h"
 
 Arduboy2 arduboy;
-Tinyfont tinyfont = Tinyfont(arduboy.sBuffer, Arduboy2::width(), Arduboy2::height());
+Tinyerfont tinyfont = Tinyerfont(arduboy.sBuffer, Arduboy2::width(), Arduboy2::height());
 
 #define MAX_RINGS 50
 #define RING_RADIUS 100
 #define NEAR_CLIP_PLANE 1.2f
-
+#define MAX_LAPS 10
 #define FRAME_RATE 40
+#define START_BOOST 50
+#define DEFAULT_LAPS 6
 
 #define MS_TO_FRAMES(ms) ((ms)/(1000/FRAME_RATE))
-#define FRAMES_TO_MS(frame) ((frame)(1000/FRAME_RATE))
+#define FRAMES_TO_MS(frame) ((frame)*(1000/FRAME_RATE))
 
 
 struct Ring {
-  float x_offset;
-  float y_offset;
   uint8_t rotation;
   uint8_t type;
 } ;
 
-uint8_t num_rings=30;
+const uint8_t num_rings=50;
 Ring rings[MAX_RINGS];
 
 struct Pointf
@@ -41,18 +41,83 @@ struct Pointf
 };
 
 
+#define LEVEL_NUM 20
+// level seeds
+int levels[] = {
+  6,4,7,2,9,1,8, 10,11,12,13,14,15,16,17,18,19,20,21,22
+  // 1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20
+};
+
+enum State {
+  MENU,
+  START_RACE,
+  RACE,
+  FINISH,
+  FINISH_MENU
+};
+
+class StateController {
+  public:
+    State state;
+    // uint16_t time = 0;
+    State next_state;
+    uint16_t next_time = 0;
+    bool just_entered = true;
+
+    void frame() {
+      if (next_time > 0) {
+        if (next_time <= FRAMES_TO_MS(1)) {
+          next_time = 0;
+          state = next_state;
+          just_entered = true;
+        } else {
+          next_time -= FRAMES_TO_MS(1);
+          just_entered = false;
+        }
+      }
+    }
+
+    void go(State next, uint16_t time=1) {
+      next_state = next;
+      next_time = time;
+    }
+
+    bool entered(State check_state) {
+      return (check_state == state && just_entered);
+    }
+
+    bool in(State a) {
+      return state == a;
+    }
+
+    bool in(State a, State b) {
+      return in(a) || in(b);
+    }
+
+    bool in(State a, State b, State c) {
+      return in(a) || in(b) || in(c);
+    }
+};
+
+StateController state;
+
+
+bool sound;
 float position = 0;
 float speed=0;
 float rot=0;
-float boost=50;
+float boost=START_BOOST;
 uint16_t crash_sequence = 0;
 int8_t x_shake;
 
+uint8_t difficulty = 1;
+uint8_t level = 0;
+uint8_t num_laps = DEFAULT_LAPS;
 uint8_t lap = 1;
-long last_lap_time = 0;
+// long best_lap_time = 0;
 long lap_start_millis = 0;
-long race_start_millis = 0;
-
+ long race_start_millis = 0;
+long lap_times[MAX_LAPS];
 
 float adj_dist(float x, float center, float dist) {
   return (x-center) * (dist*dist)/80 + center;
@@ -63,7 +128,7 @@ float adj_dist(float x, float center, float dist) {
  * 
  */
 Pointf get_rot(uint8_t rotate, uint8_t r) {
-  if (r < 3) {
+  if (r < 2) {
     uint8_t rot =  -rotate - 16;
     // if (rot < 0)
     //   return Pointf(1,0);
@@ -177,12 +242,12 @@ void draw_ring(float dist_to_cam, uint8_t offset) {
     case 4: // boost
       {
         drawArc(x,y,r, WHITE, 0,0, dither);
-        uint8_t w = 10;
+        const uint8_t w = 10;
         Pointf rot1 = get_rot(w+angle, r);
         Pointf rot2 = get_rot(angle, r);
         Pointf rot3 = get_rot(-w+angle, r);
-        uint16_t total_ms=1000;
-        uint16_t st = total_ms/7;
+        const uint16_t total_ms=800;
+        const uint16_t st = total_ms>>3;
         if (blink(MS_TO_FRAMES(3*st), MS_TO_FRAMES(total_ms), MS_TO_FRAMES(0*st))) {
           draw_arrow(x, dist_to_cam, rot1, rot2, rot3);
         }
@@ -213,10 +278,11 @@ void check_collision(uint8_t offset) {
   uint8_t ship_size=5;
   switch(rings[offset].type) {
     case 0: // lap
-      last_lap_time = lap_start_millis - millis();
-      lap_start_millis = millis();
-      lap++;
-      
+      {
+        lap_times[lap-1] = millis() - lap_start_millis;
+        lap_start_millis = millis();
+        lap++;
+      }
       break;
     case 1: // open
       break;
@@ -277,7 +343,7 @@ void draw_level() {
 
     distance_to_cam += 1;
     current_position += 1;
-    if (current_position > num_rings*ring_mult) {
+    if (current_position >= num_rings*ring_mult) {
       current_position -= num_rings*ring_mult;
     }
   }
@@ -290,7 +356,8 @@ void gen_ring(uint8_t num) {
   // rings[num].x_offset = (random(100)-50)/10.0f;
   // rings[num].y_offset = (random(100)-50)/10.0f;
   rings[num].type = random(4)+1;
-  rings[num].rotation = random(256);
+  // rings[num].rotation = random(256);
+  rings[num].rotation = random(16)*16;
 }
 
 void setup() {
@@ -303,11 +370,6 @@ void setup() {
 
   arduboy.clear();
   arduboy.setFrameRate(FRAME_RATE);
-  randomSeed(1);
-  for(uint8_t i=1; i<num_rings; i++) {
-    gen_ring(i);
-  }
-  rings[0].type = 0;
   // rings[1].type = 3;
   // rings[1].rotation = 0;
 
@@ -315,7 +377,26 @@ void setup() {
   // rings[2].rotation = 64;
 }
 
+void load_level() {
+  randomSeed(levels[level]);
+  for(uint8_t i=1; i<num_rings; i++) {
+    gen_ring(i);
+  }
 
+  for(uint8_t i=1; i<num_rings; i++) {
+    if (difficulty==0 && i%2==0) {
+      rings[i].type = 1;
+    }
+    if (difficulty<2) {
+      if (random(10) < 4) {
+        rings[i].type = 1;
+      }
+    }
+
+  }
+  rings[0].type = 0;
+  
+}
 
 float engine_force = 0;
 float mass = 500;
@@ -327,14 +408,7 @@ float turn_speed = 0;
 float turn_friction = .15;
 float turn_static_friction = .005;
 
-void draw_debug() {
-  tinyfont.setCursor(90,1);
-  tinyfont.println(position, 2);
-  tinyfont.setCursor(90,6);
-  tinyfont.println(speed*100, 2);
-  tinyfont.setCursor(90,12);
-  tinyfont.println(boost);
-
+void draw_cpu() {
   tinyfont.setCursor(2,30);
   static int cpu = 0;
   if (arduboy.everyXFrames(20)) {
@@ -345,6 +419,17 @@ void draw_debug() {
   
   tinyfont.print(cpu);
   tinyfont.print('%');
+
+}
+
+void draw_debug() {
+  tinyfont.setCursor(90,1);
+  tinyfont.print(position, 2);
+  tinyfont.setCursor(90,6);
+  tinyfont.print(speed*100, 2);
+  tinyfont.setCursor(90,12);
+  tinyfont.print(boost);
+
 }
 
 
@@ -354,7 +439,7 @@ void physics() {
     crash_sequence--;
     // if(arduboy.everyXFrames(2)) {
       x_shake = (random(25)) * crash_sequence / 100;
-      if (crash_sequence % 2) {
+      if (crash_sequence & 0x1) {
         x_shake = -x_shake;
       }
     // }
@@ -365,18 +450,22 @@ void physics() {
     return;
   } 
 
-  if(arduboy.buttonsState() & (UP_BUTTON | B_BUTTON)) {
+  if(arduboy.buttonsState() & (UP_BUTTON | A_BUTTON | B_BUTTON)) {
     // speed += 0.0001f;
 
-    engine_force++;
-    if (engine_force > 6)
-      engine_force = 6;
-    if (boost && arduboy.pressed(B_BUTTON)) {
-      engine_force *= 3;
-      boost--;
-    }
+    engine_force+=.25;
+    if (engine_force > 7)
+      engine_force = 7;
   } else {
     engine_force = 0;
+  }
+  if(arduboy.pressed(B_BUTTON)) {
+    if (boost && arduboy.pressed(B_BUTTON)) {
+      engine_force *= 3;
+      if (arduboy.everyXFrames(difficulty+1)) {
+        boost --;
+      }
+    }
   }
 
   if(arduboy.pressed(DOWN_BUTTON)) {
@@ -439,46 +528,319 @@ void physics() {
 }
 
 void draw_guages(uint8_t value1, uint8_t value2) {
-  uint8_t x=16, y=62, xmax=126, num=10, h1=2, h2=10;
-  uint8_t w=(xmax-x-64)/num;
+
+  // tinyfont.setCursor(1,46);
+  // tinyfont.print("boost");
+  // tinyfont.setCursor(109,46);
+  // tinyfont.print("speed");
+
+  const uint8_t x=16, y=62, xmax=126, num=20, h1=2, h2=10;
+  const uint8_t w=(xmax-x-64)/num;
   for (uint8_t i=0; i<num; i++) {
     uint8_t h = h1+i*(h2-h1)/num;
-    arduboy.fillRect(64-x-i*(w+1), y-h, w-1, h, (value1>i)?WHITE:BLACK);
-    arduboy.fillRect(64+x+i*w, y-h, w-1, h, (value2>i)?WHITE:BLACK);
-    
+    arduboy.fillRect(64-x-(i*w), y-h, w-1, h, (value1>i*100/num)?WHITE:BLACK);
+    arduboy.fillRect(64+x+(i*w), y-h, w-1, h, (value2>i*100/num)?WHITE:BLACK);
+  }
+  if (value1 == 100) {
+    arduboy.fillRect(64-x-(num*w)-3, y-h2, w-1+3, h2, WHITE);
+  }
+  if (value2 == 100) {
+    arduboy.fillRect(64+x+(num*w), y-h2, w-1+3, h2, WHITE);
   }
 
-  
-  // arduboy.drawLine(left, bot, tra_x, bot);
-  // arduboy.drawLine(left, bot, left, top2);
-  // arduboy.drawLine(left, top2, tra_x, top2);
-  // drawArc(tra_x, top2 - small_r, small_r, WHITE, 192, 224);
-  // drawArc(tra_x, bot - large_r, large_r, WHITE, 192, 224);
-  // arduboy.drawLine(tra_x+small_r, top2, tra_x, top2);
-  // uint8_t lengthspeed
+}
+
+void print_time(long elapsed) {
+  uint8_t minutes = min(elapsed/60000, 99);
+  long ms_elapsed=elapsed%60000;
+  uint8_t sec = ms_elapsed/1000;
+  uint8_t ms = (ms_elapsed%1000) / 10;
+  char buff[11];
+  sprintf(buff, "%3d:%02d.%02d", minutes, sec, ms);
+  tinyfont.print(buff);
 }
 
 void draw_lap() {
   tinyfont.setCursor(2,2);
-  tinyfont.print("Lap: ");
   tinyfont.print(lap);
+  tinyfont.print('/');
+  tinyfont.print(num_laps);
+  long elapsed = millis() - race_start_millis;
+  
+  tinyfont.setCursor(52, 2);
+  print_time(elapsed);
+
+  arduboy.drawLine(126,10,126,40);
+  arduboy.drawRect(125,10+position*30/num_rings, 3, 3);
 }
 
 void draw_ship() {
-  Sprites::drawExternalMask(56-(turn_speed*.3)+x_shake,45,ship, shipMask, 0,0);
+  Sprites::drawExternalMask(56-(turn_speed*.3+.5)+x_shake,45,ship, shipMask, 0,0);
+}
+
+void start_race() {
+  lap=1;
+  load_level();
+  speed = 0;
+  rot = 0;
+  turn_speed = 0;
+  boost = START_BOOST;
+}
+
+
+uint8_t menu_option = 0;
+
+void menu() {
+
+  arduboy.pollButtons();
+  char buff[5];
+
+  Sprites::drawOverwrite(5,5,logo, 0);
+
+  // tinyfont.setTextColor(WHITE);
+  tinyfont.setTextColor(WHITE);
+  if (menu_option == 0) {
+    tinyfont.setTextColor(BLACK);
+    arduboy.fillRoundRect(74,27,20,6, WHITE);
+    if (arduboy.justPressed(LEFT_BUTTON) && level > 0) {
+      level--;
+    }
+    if (arduboy.justPressed(RIGHT_BUTTON) && level < LEVEL_NUM-1) {
+      level++;
+    }
+  }
+  tinyfont.setCursor(75,28);
+  tinyfont.print("Level");
+  Sprites::drawOverwrite(95,26, menuIcon, 0);
+  Sprites::drawOverwrite(120,26, menuIcon, 1);
+  tinyfont.setCursor(107,28);
+  tinyfont.setTextColor(WHITE);
+  sprintf(buff, "%02d", level+1);
+  tinyfont.print(buff);
+
+  if (menu_option == 1) {
+    tinyfont.setTextColor(BLACK);
+    arduboy.fillRoundRect(76,37,17,6, WHITE);
+    if (arduboy.justPressed(LEFT_BUTTON) && num_laps > 1) {
+      num_laps--;
+    }
+    if (arduboy.justPressed(RIGHT_BUTTON) && num_laps < MAX_LAPS) {
+      num_laps++;
+    }
+  }
+  tinyfont.setCursor(77,38);
+  tinyfont.print("Laps");
+  Sprites::drawOverwrite(95,36, menuIcon, 0);
+  Sprites::drawOverwrite(120,36, menuIcon, 1);
+  tinyfont.setCursor(107,38);
+  tinyfont.setTextColor(WHITE);
+  sprintf(buff, "%02d", num_laps);
+  tinyfont.print(buff);
+
+  if (menu_option == 2) {
+    tinyfont.setTextColor(BLACK);
+    arduboy.fillRoundRect(57,47,37,6, WHITE);
+    if (arduboy.justPressed(LEFT_BUTTON) && difficulty > 0) {
+      difficulty--;
+    }
+    if (arduboy.justPressed(RIGHT_BUTTON) && difficulty < 2) {
+      difficulty++;
+    }
+  }
+  tinyfont.setCursor(58,48);
+  tinyfont.print("Difficulty");
+  Sprites::drawOverwrite(95,46, menuIcon, 0);
+  Sprites::drawOverwrite(120,46, menuIcon, 1);
+  tinyfont.setCursor(104,48);
+  tinyfont.setTextColor(WHITE);
+  switch(difficulty) {
+    case 0:
+      tinyfont.print("easy");
+      break;
+    case 1:
+      tinyfont.print("norm");
+      break;
+    case 2:
+      tinyfont.print("hard");
+      break;
+  }
+  
+
+  tinyfont.setCursor(73,58);
+  if (menu_option == 3) {
+    tinyfont.setTextColor(BLACK);
+    arduboy.fillRoundRect(72,57,22,6, WHITE);
+    if (arduboy.justPressed(LEFT_BUTTON)) {
+      sound = false;
+    }
+    if (arduboy.justPressed(RIGHT_BUTTON)) {
+      sound = true;
+    }
+  }
+  tinyfont.print("Sound");
+  if(sound) {
+    Sprites::drawOverwrite(103,56, menuIcon, 4);
+    Sprites::drawOverwrite(111,56, menuIcon, 5);
+  } else {
+    Sprites::drawOverwrite(103,56, menuIcon, 2);
+    Sprites::drawOverwrite(111,56, menuIcon, 3);
+  }
+  tinyfont.setTextColor(WHITE);
+
+  if (arduboy.justPressed(UP_BUTTON)) {
+    menu_option = (menu_option + 3) % 4;
+  }
+  if (arduboy.justPressed(DOWN_BUTTON)) {
+    menu_option = (menu_option + 1) % 4;
+  }
+  if (arduboy.justPressed(A_BUTTON) || arduboy.justPressed(B_BUTTON)) {
+    state.go(State::START_RACE);
+  }
+  // tinyfont.setCursor(1,43);
+  // tinyfont.print("abcdefghijklmnopqrstuvwxyz");
+  // tinyfont.setCursor(1,48);
+  // tinyfont.print("ABCDEFGHIJKLMNOPQRSTUVWXYZ");
+  // tinyfont.setCursor(1,53);
+  // tinyfont.print("0987654321)(*&^%$#@!`~\"';:");
+  // tinyfont.setCursor(1,58);
+  // tinyfont.print("<>,./?[]{}\\|_+-=");
+
+  // Sprites::drawOverwrite(20,10, menuIcon, 1);
+  // Sprites::drawOverwrite(28,10, menuIcon, 0);
+  // Sprites::drawOverwrite(36,10, menuIcon, 2);
+  // Sprites::drawOverwrite(36,10, menuIcon, 3);
+
+  // Sprites::drawOverwrite(24,26, menuIcon, 4);
+  // Sprites::drawOverwrite(32,26, menuIcon, 5);
+
+  // Sprites::drawOverwrite(24,36, menuIcon, 8);
+  // Sprites::drawOverwrite(32,36, menuIcon, 9);
+
+  // Sprites::drawOverwrite(24,46, menuIcon, 6);
+  // Sprites::drawOverwrite(32,46, menuIcon, 7);
+
+}
+
+void draw_finish() {
+  arduboy.pollButtons();
+  arduboy.setCursor(20,20);
+  arduboy.print("FINISH!");
+  long total = 0;
+  for(uint8_t i=0;i<num_laps;i++) {
+    tinyfont.setCursor(87, 3+i*5);
+    tinyfont.print(i+1);
+    tinyfont.setCursor(98, 3+i*5);
+    print_time(lap_times[i]);
+    total += lap_times[i];
+  }
+  tinyfont.setCursor(21,43);
+  tinyfont.print("Race Time:");
+  tinyfont.setCursor(25,49);
+  print_time(total);
+  tinyfont.setCursor(31,3);
+  tinyfont.print("level:");
+  tinyfont.setCursor(54,3);
+  tinyfont.print(level+1);
+
+  if (state.entered(State::FINISH)) {
+    state.go(State::FINISH_MENU, 1500);
+  }
+
+  if (state.in(State::FINISH_MENU)) {
+    Sprites::drawOverwrite(5,55, menuIcon, 0);
+    tinyfont.setCursor(16,57);
+    tinyfont.print("Menu");
+    Sprites::drawOverwrite(115,55, menuIcon, 1);
+    tinyfont.setCursor(75,57);
+    tinyfont.print("Next Level");
+
+    if (arduboy.justPressed(LEFT_BUTTON) || arduboy.justPressed(A_BUTTON)) {
+      state.go(State::MENU);
+    }
+    if (arduboy.justPressed(RIGHT_BUTTON) || arduboy.justPressed(B_BUTTON)) {
+      level = ((level + 1) % LEVEL_NUM);
+      state.go(State::START_RACE);
+    }
+  }
 }
 
 void loop() {
+
   if (!arduboy.nextFrame()) {
     return;
   }
+  state.frame();
 
-  physics();
+  if (state.in(State::MENU)) {
+    menu();
+    // arduboy.display(CLEAR_BUFFER);
+    // return;
+  }
+
+  if (state.entered(State::START_RACE)) {
+    start_race();
+    state.go(State::RACE, 1500);
+  }
+
+
+  if (0) {
+    for(uint8_t i=0; i<=127; i+=10) {
+      arduboy.drawLine(i,0,i,64,WHITE);
+      for (uint8_t j=0; j<=63; j+=10) {
+        arduboy.drawLine(0,j,128,j,WHITE);
+      }
+    }
+  }
+
+  if (lap > num_laps) {
+    lap = 1;
+    state.go(State::FINISH);
+  }
+
+  if (state.in(State::FINISH, State::FINISH_MENU)) {
+  // if (1) {
+    draw_finish();
+
+    // arduboy.setCursor(10,10);
+    // arduboy.print("Best Lap:");
+    // tinyfont.setCursor(10,30);
+    // print_time(best_lap_time);
+
+    // arduboy.setCursor(10,40);
+    // arduboy.print("Total time:");
+    // tinyfont.setCursor(10,50);
+    // print_time(race_start_millis);
+
+    // arduboy.display(CLEAR_BUFFER);
+    // return;
+  }
+
+  if (state.in(State::RACE, State::START_RACE)) {
+    draw_level();
+    draw_ship();
+  }
+
+  if (state.in(State::RACE)) {
+    physics();
+    draw_lap();
+    draw_guages(boost/2, min(speed*800,100));
+  }
+
+  // if (state.in(State::GO)) {
+  //   arduboy.setCursor(57, 26);
+  //   arduboy.print("GO");
+  // }
+
+  if (state.in(State::START_RACE)) {
+    // resets each frame
+    lap_start_millis = millis();
+    race_start_millis = lap_start_millis;
+    
+    arduboy.setCursor(60, 26);
+    arduboy.print(state.next_time/500 + 1);
+  }
+
   // draw_debug();
-  draw_level();
-  draw_ship();
-  draw_lap();
-  draw_guages(boost/20, min(speed*100,10));
-  
+  // draw_cpu();
   arduboy.display(CLEAR_BUFFER);
 }

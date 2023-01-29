@@ -38,14 +38,14 @@ bool is_draw(uint8_t count, uint8_t dither, uint8_t r) {
     
 }
 
-uint8_t drawArcHelper(int16_t x0, int16_t y0, uint8_t r, uint8_t color, uint8_t mask, uint8_t max, uint8_t min, uint8_t dither=0)
+uint8_t drawArcHelper(int8_t x0, int8_t y0, uint8_t r, uint8_t color, uint8_t mask, uint8_t max, uint8_t min, uint8_t dither=0)
 {
-  int16_t f = 1 - r;
-  int16_t ddF_x = 1;
-  int16_t ddF_y = -2 * r;
-  int16_t x = 0;
-  int16_t y = r;
-  int16_t count = 0;
+  int8_t f = 1 - r;
+  int8_t ddF_x = 1;
+  int8_t ddF_y = -2 * r;
+  int8_t x = 0;
+  int8_t y = r;
+  int8_t count = 0;
 
   while (x<y)
   {
@@ -76,7 +76,7 @@ uint8_t drawArcHelper(int16_t x0, int16_t y0, uint8_t r, uint8_t color, uint8_t 
 }
 
 
-void drawArc(int16_t x0, int16_t y0, uint8_t r, uint8_t color, uint8_t start_percentage, uint8_t stop_percentage,uint8_t dither=0) {
+void drawArc(int8_t x0, int8_t y0, uint8_t r, uint8_t color, uint8_t start_percentage, uint8_t stop_percentage,uint8_t dither=0) {
 
   if (dither >= 5) return;
   uint8_t quadrants_mask = _get_quadrants(start_percentage, stop_percentage);
