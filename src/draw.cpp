@@ -38,30 +38,17 @@ bool is_draw(uint8_t count, uint8_t dither, uint8_t r) {
     
 }
 
+
+
 uint8_t drawArcHelper(int8_t x0, int8_t y0, uint8_t r, uint8_t color, uint8_t mask, uint8_t max, uint8_t min, uint8_t dither=0)
 {
-  int8_t f = 1 - r;
-  int8_t ddF_x = 1;
-  int8_t ddF_y = -2 * r;
-  int8_t x = 0;
-  int8_t y = r;
-  int8_t count = 0;
+  uint8_t y = r;
+  uint8_t x = 0;
+  int8_t d = 1 - r;
 
-  while (x<y)
-  {
-    count++;
-    if (f >= 0)
-    {
-      y--;
-      ddF_y += 2;
-      f += ddF_y;
-    }
-
+  while(x < y) {
     x++;
-    ddF_x += 2;
-    f += ddF_x;
-
-    if(count >= min && count <= max && is_draw(count, dither, r)) {
+    if(x >= min && x <= max && is_draw(x, dither, r)) {
       if (mask & 0b00000001) arduboy.drawPixel(x0 + y, y0 - x, color);
       if (mask & 0b00000010) arduboy.drawPixel(x0 + x, y0 - y, color);
       if (mask & 0b00000100) arduboy.drawPixel(x0 - x, y0 - y, color);
@@ -71,8 +58,14 @@ uint8_t drawArcHelper(int8_t x0, int8_t y0, uint8_t r, uint8_t color, uint8_t ma
       if (mask & 0b01000000) arduboy.drawPixel(x0 + x, y0 + y, color);
       if (mask & 0b10000000) arduboy.drawPixel(x0 + y, y0 + x, color);
     }
+    if (d<0) {
+      d += (x<<1) + 1;
+    } else {
+      y = y - 1;
+      d += ((x-y)<<1) + 1;
+    }
   }
-  return count;
+  return x;
 }
 
 
