@@ -4,10 +4,13 @@
 #include <Tinyerfont.h>
 #include <Sprites.h>
 
-
+#include "state.h"
 #include "draw.h"
 #include "images.h"
 
+//#define DRAW_GRID 1
+//#define DRAW_CPU 1
+//#define DRAW_DEBUG 1
 
 const uint8_t MAX_RINGS = 50;
 const uint8_t RING_RADIUS = 100;
@@ -29,6 +32,57 @@ const uint16_t EEPROM_OFFSET = 564;
 Arduboy2 arduboy;
 Tinyerfont tinyfont = Tinyerfont(arduboy.sBuffer, Arduboy2::width(), Arduboy2::height());
 
+
+bool save_laps;
+float position = 0;
+float speed=0;
+float rot=0;
+float boost=START_BOOST;
+uint16_t crash_sequence = 0;
+int8_t x_shake;
+
+uint8_t difficulty = 1;
+uint8_t level = 0;
+uint8_t num_laps = DEFAULT_LAPS;
+uint8_t lap = 1;
+long lap_start_millis = 0;
+long race_start_millis = 0;
+long lap_times[MAX_LAPS];
+
+float engine_force = 0;
+float mass = 500;
+float drag = 100;
+float friction = .1;
+float braking_friction = 0;
+
+float turn_speed = 0;
+float turn_friction = .15;
+float turn_static_friction = .005;
+
+// level seeds
+int levels[] = {
+  6,4,7,2,9,1,8, 10,11,12,13,14,15,16,17,18,19,20,21,22
+};
+
+
+enum State {
+  MENU,
+  START_RACE,
+  RACE,
+  FINISH,
+  FINISH_MENU
+};
+
+
+StateController<State, FRAMES_TO_MS(1)> state;
+
+
+/**
+ * @brief Save laps to eeprom
+ * 
+ * Packs a time for each level into 12bits (* 20 levels) -> 30 bytes + 1 byte xor'ed hash
+ * The default save option is determined based on if the hash matches or not.
+ */
 class SaveData {
   public:
     static const uint8_t BYTES = (LEVEL_NUM * 12+4)/8;
@@ -92,14 +146,30 @@ class SaveData {
 
 };
 
+
 SaveData save_data;
 
 
+enum RingType {
+  START_LINE=0,
+  OPEN=1,
+  ONE_THIRD=2,
+  MIDDLE=3,
+  BOOSTER=4
+};
+
+/**
+ * @brief One ring of the level.
+ * 
+ * The level has MAX_RINGS rings each being one of 5 types (Start line, empty, bar, half circle, boost).
+ * The rotation specifies the rotation of each obstacle (360 degrees being a value of 256)
+  */
 struct Ring {
   uint8_t rotation;
-  uint8_t type;
+  RingType type;
 } ;
 Ring rings[MAX_RINGS];
+
 
 struct Pointf
 {
@@ -113,86 +183,6 @@ struct Pointf
 };
 
 
-// level seeds
-int levels[] = {
-  6,4,7,2,9,1,8, 10,11,12,13,14,15,16,17,18,19,20,21,22
-  // 1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20
-};
-
-
-
-enum State {
-  MENU,
-  START_RACE,
-  RACE,
-  FINISH,
-  FINISH_MENU
-};
-
-class StateController {
-  public:
-    State state;
-    // uint16_t time = 0;
-    State next_state;
-    uint16_t next_time = 0;
-    bool just_entered = true;
-
-    void frame() {
-      if (next_time > 0) {
-        if (next_time <= FRAMES_TO_MS(1)) {
-          next_time = 0;
-          state = next_state;
-          just_entered = true;
-        } else {
-          next_time -= FRAMES_TO_MS(1);
-          just_entered = false;
-        }
-      }
-    }
-
-    void go(State next, uint16_t time=1) {
-      next_state = next;
-      next_time = time;
-    }
-
-    bool entered(State check_state) {
-      return (check_state == state && just_entered);
-    }
-
-    bool in(State a) {
-      return state == a;
-    }
-
-    bool in(State a, State b) {
-      return in(a) || in(b);
-    }
-
-    bool in(State a, State b, State c) {
-      return in(a) || in(b) || in(c);
-    }
-};
-
-
-StateController state;
-
-
-bool save_laps;
-float position = 0;
-float speed=0;
-float rot=0;
-float boost=START_BOOST;
-uint16_t crash_sequence = 0;
-int8_t x_shake;
-
-uint8_t difficulty = 1;
-uint8_t level = 0;
-uint8_t num_laps = DEFAULT_LAPS;
-uint8_t lap = 1;
-// long best_lap_time = 0;
-long lap_start_millis = 0;
- long race_start_millis = 0;
-long lap_times[MAX_LAPS];
-
 float adj_dist(float x, float center, float dist) {
   return (x-center) * (dist*dist)/80 + center;
 }
@@ -200,12 +190,14 @@ float adj_dist(float x, float center, float dist) {
 /**
  * @brief get x,y units for rotating 0-255
  * 
+ * Not great. We'll fix this at some point. At least for the half circles and bars, the 
+ * x,y coordinates already exist in the arc drawing code. It's just a matter of extracting
+ * those to avoid sin/cos.
  */
 Pointf get_rot(uint8_t rotate, uint8_t r) {
-  if (r < 2) {
+  // TODO - trig is really slow. Replace with a real lookup table, or from the arc code
+  if (r < 3) {
     uint8_t rot =  -rotate - 16;
-    // if (rot < 0)
-    //   return Pointf(1,0);
     if (rot < 32)
       return Pointf(.707f, .707f);
     if (rot < 64)
@@ -227,6 +219,7 @@ Pointf get_rot(uint8_t rotate, uint8_t r) {
   }
 }
 
+
 Pointf get_circ_pt(Pointf center, float r, Pointf rotate) {
   return Pointf(center.x+r*rotate.x, center.y+r*rotate.y);
 }
@@ -236,14 +229,34 @@ float y_adj_center(float dist_to_cam) {
   return max(-128, -80/(dist_to_cam));
 }
 
+
 float size_adj(float dist_to_cam) {
   return min(128,2*64/(dist_to_cam));
 }
 
+
+/**
+ * @brief Helper to blink something based on frame
+ * 
+ * @param on_frames how long to stay on
+ * @param total_frames how long a period is
+ * @param offset_frames how much to offset the blink
+ * @return true or false
+ */
 bool blink(uint16_t on_frames, uint16_t total_frames, uint16_t offset_frames=0) {
   return ((arduboy.frameCount - offset_frames) % total_frames) < on_frames;
 }
 
+
+/**
+ * @brief draw a booster arrow
+ * 
+ * @param x 
+ * @param d2cam1 
+ * @param rot1 xy ratio for rotation of left point
+ * @param rot2 xy ratio for rotation of center point
+ * @param rot3 xy ratio for rotation of right point
+ */
 void draw_arrow(float x, float d2cam1, Pointf rot1, Pointf rot2, Pointf rot3) {
   float pt_dist = 1.0f;
   Pointf xy = Pointf(x, 32+y_adj_center(d2cam1));
@@ -258,6 +271,15 @@ void draw_arrow(float x, float d2cam1, Pointf rot1, Pointf rot2, Pointf rot3) {
   arduboy.drawLine(p3.x,p3.y,p2.x,p2.y, WHITE);
 }
 
+
+/**
+ * @brief Draw a level ring
+ * Draw one of the main rings defined in the level. (There are other rings
+ * in between these)
+ * 
+ * @param dist_to_cam how close are we to the camera so we can position and size ourselves
+ * @param offset offset into the level array for this ring
+ */
 void draw_ring(float dist_to_cam, uint8_t offset) {
   float y = 32+y_adj_center(dist_to_cam);
   float r = size_adj(dist_to_cam);
@@ -270,31 +292,19 @@ void draw_ring(float dist_to_cam, uint8_t offset) {
       drawArc(x,y,r, WHITE, 0, 0);
       drawArc(x,y,r+2, WHITE, 0, 0, dither);
       drawArc(x,y,r+4, WHITE, 0, 0, dither);
-      // drawArc(x,y,r, WHITE, 160+angle, 224+angle);
-      // drawArc(x,y,r, WHITE, 32+angle, 96+angle);
       break;
     case 1: // open
-      // if (dither<5) {
-        // arduboy.drawCircle(x, y, r, color);
-        drawArc(x, y, r, WHITE, 0, 0, dither);
-      // }
+      drawArc(x, y, r, WHITE, 0, 0, dither);
       break;
     case 2: // 1/3
       {
-        // if (dither < 5) {
-          drawArc(x,y,r, WHITE, 96+angle, angle, dither);
-        // }
+        drawArc(x,y,r, WHITE, 96+angle, angle, dither);
         Pointf rot1 = get_rot(angle, r);
         Pointf rot2 = get_rot(96+angle, r);
         Pointf start = get_circ_pt(Pointf(x,y), r, rot1);
         Pointf stop = get_circ_pt(Pointf(x,y), r, rot2);
-        // Pointf start2 = get_circ_pt(Pointf(x,y), r-2, rot1);
-        // Pointf stop2 = get_circ_pt(Pointf(x,y), r-2, rot2);
         arduboy.drawLine(start.x, start.y, stop.x, stop.y, WHITE);
         drawArc(x,y,r, WHITE, angle, 96+angle);
-        // arduboy.drawLine(start2.x, start2.y, start.x, start.y, WHITE);
-        // arduboy.drawLine(start2.x, start2.y, stop2.x, stop2.y, WHITE);
-        // arduboy.drawLine(stop.x, stop.y, stop2.x, stop2.y, WHITE);
       }
       break;
     case 3: // middle
@@ -342,35 +352,43 @@ void draw_ring(float dist_to_cam, uint8_t offset) {
   };
 }
 
+
+/**
+ * @brief You have crashed. Darn.
+ * 
+ */
 void crash() {
   crash_sequence = max(min(40*(speed*20),FRAME_RATE*3/2), 10);
   speed = 0;
 }
 
+
+/**
+ * @brief Checks for collisions the first frame after passing an offset.
+ * This results in possibly thinking you hit a boost pad, but you actually
+ * missed the beginning. Oh well; do better!
+ * 
+ * @param offset 
+ */
 void check_collision(uint8_t offset) {
   uint8_t angle = (uint8_t)(-64-rot - rings[offset].rotation);
   uint8_t ship_size=5;
   switch(rings[offset].type) {
-    case 0: // lap
+    case RingType::START_LINE:
       {
         lap_times[lap-1] = millis() - lap_start_millis;
         lap_start_millis = millis();
         lap++;
       }
       break;
-    case 1: // open
+    case RingType::OPEN:
       break;
-    case 2: // 1/3 (0,96)
-      // if (angle > 96-ship_size && angle < 192+ship_size) {
+    case RingType::ONE_THIRD: // (0,96)
       if (angle < 96+ship_size || angle > 256-ship_size) {
-  
-  // arduboy.display();
-  // delay(1000);
-
         crash();
       }
       break;
-    case 3: // middle (+-7)
+    case RingType::MIDDLE: // (+-7)
       if (angle < ship_size+7 || angle > 256-ship_size-7) {
         crash();
       }
@@ -378,8 +396,7 @@ void check_collision(uint8_t offset) {
         crash();
       }
       break;
-    case 4: // powerup (+-10)
-      // if (angle < 192+ship_size+10 && angle > 192-ship_size-10) {
+    case RingType::BOOSTER: // (+-10)
       if (angle < ship_size+10 || angle > 256-ship_size-10) {
         boost = min(200, boost+20);
       }
@@ -388,18 +405,19 @@ void check_collision(uint8_t offset) {
 }
 
 
-// void draw_ring(float dist_to_cam, uint8_t offset) {
-//   float y = 32+y_adj_center(dist_to_cam);
-//   float size = size_adj(dist_to_cam);
-//   draw_ring(64,y,size,offset,uint8_t(dist_to_cam/2), dist_to_cam);
-// }
-
+/**
+ * @brief Draw a generic in-between ring.
+ * More dithered than the normal level rings
+ * 
+ * @param dist_to_cam 
+ */
 void draw_generic_ring(float dist_to_cam) {
   drawArc(64+x_shake,32+y_adj_center(dist_to_cam),size_adj(dist_to_cam), WHITE, 0, 0, uint8_t(dist_to_cam*3/5));
 }
 
+
 void draw_level() {
-  uint8_t drawn_rings=32;
+  uint8_t drawn_rings=36;
   uint8_t ring_mult = 8;
   float draw_pos = position-0.1;
   
@@ -424,27 +442,20 @@ void draw_level() {
 }
 
 
-
 void gen_ring(uint8_t num) {
-  rings[num].type = random(4)+1;
+  rings[num].type = (RingType)(random(4)+1);
   rings[num].rotation = random(16)*16;
 }
 
-void setup() {
-  arduboy.begin();
 
-  save_data.load();
-  save_laps = save_data.valid();
-  if (!save_laps) {
-    save_data.clear();
-  }
-
-  arduboy.clear();
-  arduboy.setFrameRate(FRAME_RATE);
-
-  state.go(State::MENU);
-}
-
+/**
+ * @brief Generate the current level
+ * 
+ * Levels are generated by feeding a seed into the random number generator, so
+ * they are random, but consistent.
+ * Easy and normal difficulty set more of the rings to type 1 (empty)
+ * 
+ */
 void load_level() {
   randomSeed(levels[level]);
   for(uint8_t i=1; i<NUM_RINGS; i++) {
@@ -453,28 +464,18 @@ void load_level() {
 
   for(uint8_t i=1; i<NUM_RINGS; i++) {
     if (difficulty==0 && i%2==0) {
-      rings[i].type = 1;
+      rings[i].type = RingType::OPEN;
     }
     if (difficulty<2) {
       if (random(10) < 4) {
-        rings[i].type = 1;
+        rings[i].type = RingType::OPEN;
       }
     }
 
   }
-  rings[0].type = 0;
-  
+  rings[0].type = RingType::START_LINE;
 }
 
-float engine_force = 0;
-float mass = 500;
-float drag = 100;
-float friction = .1;
-float braking_friction = 0;
-
-float turn_speed = 0;
-float turn_friction = .15;
-float turn_static_friction = .005;
 
 void draw_cpu() {
   tinyfont.setCursor(2,30);
@@ -487,8 +488,8 @@ void draw_cpu() {
   
   tinyfont.print(cpu);
   tinyfont.print('%');
-
 }
+
 
 void draw_debug() {
   tinyfont.setCursor(90,1);
@@ -497,7 +498,6 @@ void draw_debug() {
   tinyfont.print(speed*100, 2);
   tinyfont.setCursor(90,12);
   tinyfont.print(boost);
-
 }
 
 
@@ -516,26 +516,27 @@ void physics() {
     return;
   } 
 
+  uint8_t max_engine_force = (difficulty==2)?9:7;
   if(arduboy.buttonsState() & (UP_BUTTON | A_BUTTON | B_BUTTON)) {
     engine_force+=.25;
-    if (engine_force > 7)
-      engine_force = 7;
+    if (engine_force > max_engine_force)
+      engine_force = max_engine_force;
   } else {
     engine_force = 0;
   }
   if(arduboy.pressed(B_BUTTON)) {
     if (boost && arduboy.pressed(B_BUTTON)) {
       engine_force *= 3;
-      if (arduboy.everyXFrames(difficulty+1)) {
+      if (arduboy.everyXFrames(2) || difficulty != 2) {
         boost --;
       }
     }
   }
 
   if(arduboy.pressed(DOWN_BUTTON)) {
-    braking_friction += 1;
-    if (braking_friction > 20) {
-      braking_friction=20;
+    braking_friction += 2;
+    if (braking_friction > 30) {
+      braking_friction=30;
     }
   } else {
     braking_friction -= 5;
@@ -582,9 +583,8 @@ void physics() {
   if((uint8_t)last_position != (uint8_t)position) {
     check_collision((uint8_t)position);
   }
-
-
 }
+
 
 void draw_guages(uint8_t value1, uint8_t value2) {
 
@@ -601,8 +601,8 @@ void draw_guages(uint8_t value1, uint8_t value2) {
   if (value2 == 100) {
     arduboy.fillRect(64+x+(num*w), y-h2, w-1+3, h2, WHITE);
   }
-
 }
+
 
 void print_time(long elapsed) {
   uint8_t minutes = min(elapsed/60000, 99);
@@ -613,6 +613,7 @@ void print_time(long elapsed) {
   sprintf(buff, "%3d:%02d.%02d", minutes, sec, ms);
   tinyfont.print(buff);
 }
+
 
 void draw_lap() {
   tinyfont.setCursor(2,2);
@@ -628,9 +629,11 @@ void draw_lap() {
   arduboy.drawRect(125,10+position*30/NUM_RINGS, 3, 3);
 }
 
+
 void draw_ship() {
   Sprites::drawExternalMask(56-(turn_speed*.3+.5)+x_shake,45,ship, shipMask, 0,0);
 }
+
 
 void start_race() {
   lap=1;
@@ -642,10 +645,8 @@ void start_race() {
 }
 
 
-uint8_t menu_option = 0;
-
 void menu() {
-
+  static uint8_t menu_option = 0;
   arduboy.pollButtons();
   char buff[5];
 
@@ -749,8 +750,8 @@ void menu() {
   if (arduboy.justPressed(A_BUTTON) || arduboy.justPressed(B_BUTTON)) {
     state.go(State::START_RACE);
   }
-
 }
+
 
 void draw_finish() {
   arduboy.pollButtons();
@@ -829,50 +830,28 @@ void draw_finish() {
   }
 }
 
+
+void setup() {
+  arduboy.begin();
+
+  save_data.load();
+  save_laps = save_data.valid();
+  if (!save_laps) {
+    save_data.clear();
+  }
+
+  arduboy.clear();
+  arduboy.setFrameRate(FRAME_RATE);
+
+  state.go(State::MENU);
+}
+
+
 void loop() {
 
   if (!arduboy.nextFrame()) {
     return;
   }
-
-
-  // arduboy.clear();
-  // tinyfont.setCursor(1,1);
-  // tinyfont.print(save_data.get_level(0));
-  // tinyfont.setCursor(50,1);
-  // tinyfont.print(save_data.get_level(1));
-  // tinyfont.setCursor(90,1);
-  // tinyfont.print(save_data.get_level(2));
-  // tinyfont.setCursor(1,10);
-  // char buff[10];
-  // for (int i=0;i<sizeof(save_data.data);i++) {
-  //   sprintf(buff, "%02X", *(((uint8_t *)((void *)&save_data.data))+i));
-  //   tinyfont.print(buff);
-  //   tinyfont.print(" ");
-  //   if(i%10==9) {
-  //     tinyfont.print("\n");
-  //   }
-  // }
-  // tinyfont.setCursor(1,30);
-  // tinyfont.print((save_data.valid()?"valid":"invalid"));
-  
-  // tinyfont.setCursor(1,40);
-  // tinyfont.print(save_data.get_hash());
-
-  // arduboy.display();
-  // save_data.load();
-  // save_data.set_level(2,10020);
-  // save_data.set_level(1,10020);
-  // delay(5000);
-  // return;
-  // save_data.load();
-  // save_laps = save_data.valid();
-  // if (!save_laps) {
-  //   save_data.clear();
-  // }
-
-
-
 
   state.frame();
 
@@ -885,15 +864,14 @@ void loop() {
     state.go(State::RACE, 1500);
   }
 
-
-  if (0) {
-    for(uint8_t i=0; i<=127; i+=10) {
-      arduboy.drawLine(i,0,i,64,WHITE);
-      for (uint8_t j=0; j<=63; j+=10) {
-        arduboy.drawLine(0,j,128,j,WHITE);
-      }
+#ifdef DRAW_GRID
+  for(uint8_t i=0; i<=127; i+=10) {
+    arduboy.drawLine(i,0,i,64,WHITE);
+    for (uint8_t j=0; j<=63; j+=10) {
+      arduboy.drawLine(0,j,128,j,WHITE);
     }
   }
+#endif
 
   if (lap > num_laps) {
     lap = 1;
@@ -915,11 +893,6 @@ void loop() {
     draw_guages(boost/2, min(speed*800,100));
   }
 
-  // if (state.in(State::GO)) {
-  //   arduboy.setCursor(57, 26);
-  //   arduboy.print("GO");
-  // }
-
   if (state.in(State::START_RACE)) {
     // resets each frame
     lap_start_millis = millis();
@@ -929,7 +902,11 @@ void loop() {
     arduboy.print(state.next_time/500 + 1);
   }
 
-  // draw_debug();
-  // draw_cpu();
+#ifdef DRAW_DEBUG
+  draw_debug();
+#endif
+#ifdef DRAW_CPU 
+  draw_cpu();
+#endif
   arduboy.display(CLEAR_BUFFER);
 }
